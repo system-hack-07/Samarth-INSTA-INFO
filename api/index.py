@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Samarth Insta Info — Vercel serverless function with retry + UA rotation."""
+"""Samarth Insta Info — Vercel serverless function (10s budget)."""
 
-import os
 import re
 import time
 import random
@@ -26,15 +25,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
-]
-
-PROXIES = [
-    # Add free/paid proxies here, e.g.:
-    # "http://user:pass@host:port",
-    # "socks5://host:port",
 ]
 
 
@@ -49,13 +40,6 @@ def get_headers():
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://www.instagram.com/",
     }
-
-
-def get_proxy():
-    if not PROXIES:
-        return None
-    p = random.choice(PROXIES)
-    return {"http": p, "https": p}
 
 
 def cache_get(key):
@@ -83,63 +67,46 @@ def normalize_username(u):
     return u.lower()
 
 
-def fetch_profile_with_retry(username, max_attempts=5):
-    endpoints = [
-        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
-        f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
-        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}&__a=1",
-    ]
+def fetch_profile(username):
+    """Single fast attempt with a tight 6s timeout. Vercel budget = 10s."""
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
 
-    last_error = None
+    r = requests.get(
+        url,
+        headers=get_headers(),
+        timeout=6,          # <-- hard cap
+        verify=False,
+    )
 
-    for attempt in range(max_attempts):
-        endpoint = endpoints[attempt % len(endpoints)]
-        headers = get_headers()
-        proxy = get_proxy()
+    if r.status_code == 429:
+        raise ValueError("Rate limited (429) by Instagram")
+    if r.status_code != 200:
+        raise ValueError(f"Instagram returned {r.status_code}")
 
-        try:
-            r = requests.get(endpoint, headers=headers, proxies=proxy, timeout=20, verify=False)
+    raw = r.json()
+    user = (raw.get("data") or {}).get("user")
+    if not user:
+        raise ValueError("Profile not found or private")
 
-            if r.status_code == 429:
-                last_error = f"Rate limited (429) on attempt {attempt + 1}"
-                time.sleep(min(1 * (2 ** attempt), 3))
-                continue
-
-            if r.status_code != 200:
-                last_error = f"Instagram returned {r.status_code}"
-                continue
-
-            raw = r.json()
-            user = (raw.get("data") or {}).get("user")
-            if not user:
-                last_error = "Profile not found or private"
-                continue
-
-            return {
-                "username": user.get("username"),
-                "full_name": user.get("full_name"),
-                "biography": user.get("biography"),
-                "is_private": user.get("is_private"),
-                "is_verified": user.get("is_verified"),
-                "is_business": user.get("is_business_account"),
-                "profile_pic": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
-                "external_url": user.get("external_url"),
-                "category": user.get("category_name"),
-                "followers": (user.get("edge_followed_by") or {}).get("count"),
-                "following": (user.get("edge_follow") or {}).get("count"),
-                "posts": (user.get("edge_owner_to_timeline_media") or {}).get("count"),
-                "user_id": user.get("id"),
-                "business_email": user.get("business_email"),
-                "business_phone": user.get("business_phone_number"),
-                "pronouns": user.get("pronouns"),
-                "has_channel": user.get("has_channel"),
-            }
-
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-            time.sleep(0.5)
-
-    raise ValueError(last_error or "All attempts failed")
+    return {
+        "username": user.get("username"),
+        "full_name": user.get("full_name"),
+        "biography": user.get("biography"),
+        "is_private": user.get("is_private"),
+        "is_verified": user.get("is_verified"),
+        "is_business": user.get("is_business_account"),
+        "profile_pic": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
+        "external_url": user.get("external_url"),
+        "category": user.get("category_name"),
+        "followers": (user.get("edge_followed_by") or {}).get("count"),
+        "following": (user.get("edge_follow") or {}).get("count"),
+        "posts": (user.get("edge_owner_to_timeline_media") or {}).get("count"),
+        "user_id": user.get("id"),
+        "business_email": user.get("business_email"),
+        "business_phone": user.get("business_phone_number"),
+        "pronouns": user.get("pronouns"),
+        "has_channel": user.get("has_channel"),
+    }
 
 
 def analyze_bio(bio):
@@ -201,12 +168,12 @@ def insta_info(username):
     now = datetime.now(timezone.utc).isoformat()
 
     try:
-        profile = fetch_profile_with_retry(username)
+        profile = fetch_profile(username)
     except Exception as e:
         return jsonify({
             "success": False,
             "error": str(e),
-            "hint": "Instagram is rate-limiting this server's IP. Try again in a minute.",
+            "hint": "Instagram rate-limited this server. Try again shortly.",
         }), 429
 
     result = {
