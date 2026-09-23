@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Samarth Insta Info — public Instagram profile lookup."""
+"""
+Samarth Insta Info — Vercel serverless function.
+"""
 
 import os
 import re
-import sys
 import time
 import threading
 from datetime import datetime, timezone
@@ -17,18 +18,9 @@ from flask_cors import CORS
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ---------------------------------------------------------------
-# Paths — always resolve from THIS file, not the cwd
-# ---------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-sys.path.insert(0, BASE_DIR)
-import storage  # noqa: E402
-
-# ---------------------------------------------------------------
-# Flask
-# ---------------------------------------------------------------
 app = Flask(__name__)
 CORS(app)
 
@@ -164,18 +156,17 @@ def fetch_profile_fallback(username):
 
 def analyze_bio(bio):
     if not bio:
-        return {"language": None, "hashtags": [], "mentions": [], "length": 0}
+        return {"hashtags": [], "mentions": [], "length": 0}
     hashtags = re.findall(r'#(\w+)', bio)
     mentions = re.findall(r'@(\w+)', bio)
     return {
-        "language": None,
         "hashtags": list(dict.fromkeys(hashtags))[:20],
         "mentions": list(dict.fromkeys(mentions))[:20],
         "length": len(bio),
     }
 
 
-def compute_trust_score(p, history):
+def compute_trust_score(p):
     score = 50
     signals = []
 
@@ -253,26 +244,8 @@ def insta_info(username):
             "details": errors,
         }), 502
 
-    try:
-        storage.save_snapshot(profile, now)
-        storage.save_profile_meta(username, {"user_id": profile.get("user_id")}, now)
-    except Exception:
-        pass
-
-    history = storage.get_history(username, 90)
     bio_analysis = analyze_bio(profile.get("biography"))
-    trust = compute_trust_score(profile, history)
-
-    growth = None
-    if len(history) >= 2:
-        first = history[0].get("followers") or 0
-        last = history[-1].get("followers") or 0
-        if first > 0:
-            growth = {
-                "delta": last - first,
-                "percent": round(((last - first) / first) * 100, 2),
-                "samples": len(history),
-            }
+    trust = compute_trust_score(profile)
 
     result = {
         "success": True,
@@ -280,8 +253,8 @@ def insta_info(username):
             "profile": profile,
             "bio_analysis": bio_analysis,
             "trust": trust,
-            "history": history,
-            "growth": growth,
+            "history": [],
+            "growth": None,
             "checked_at": now,
         },
     }
@@ -300,11 +273,6 @@ def index():
     return send_from_directory(ROOT_DIR, "index.html")
 
 
-@app.route("/favicon.ico")
-def favicon():
-    return "", 204
-
-
 @app.errorhandler(404)
 def not_found(e):
     if request.path.startswith("/api/"):
@@ -316,9 +284,5 @@ def not_found(e):
     return send_from_directory(ROOT_DIR, "index.html")
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"\n  Samarth Insta Info")
-    print(f"  Frontend:  http://localhost:{port}/")
-    print(f"  API test:  http://localhost:{port}/api/insta/nasa\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+# Vercel looks for a variable named `app`
+handler = app
