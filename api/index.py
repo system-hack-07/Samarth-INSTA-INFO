@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Samarth Insta Info — Vercel serverless function.
-"""
-
 import os
 import re
 import time
@@ -13,16 +9,11 @@ from datetime import datetime, timezone
 
 import requests
 import urllib3
-from flask import Flask, jsonify, send_from_directory, request
-from flask_cors import CORS
+from flask import Flask, jsonify, request
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
-
 app = Flask(__name__)
-CORS(app)
 
 CACHE = {}
 CACHE_TTL = 300
@@ -68,20 +59,6 @@ def normalize_username(u):
     return u.lower()
 
 
-def parse_count(s):
-    if s is None:
-        return None
-    if isinstance(s, int):
-        return s
-    s = str(s).strip().replace(',', '')
-    m = re.match(r'^([\d.]+)\s*([KMB]?)$', s, re.I)
-    if not m:
-        return None
-    n = float(m.group(1))
-    mult = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
-    return int(n * mult.get(m.group(2).upper(), 1))
-
-
 def fetch_profile(username):
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     r = requests.get(url, headers=HEADERS, timeout=15, verify=False)
@@ -109,48 +86,8 @@ def fetch_profile(username):
         "user_id": user.get("id"),
         "business_email": user.get("business_email"),
         "business_phone": user.get("business_phone_number"),
-        "bio_links": [l.get("url") for l in (user.get("bio_links") or []) if l.get("url")],
         "pronouns": user.get("pronouns"),
         "has_channel": user.get("has_channel"),
-    }
-
-
-def fetch_profile_fallback(username):
-    url = f"https://www.instagram.com/{username}/"
-    r = requests.get(url, headers=HEADERS, timeout=15, verify=False)
-    if r.status_code != 200:
-        raise ValueError(f"Instagram returned {r.status_code}")
-
-    html = r.text
-    m = re.search(r'<meta property="og:description" content="([^"]+)"', html)
-    desc = m.group(1) if m else ""
-
-    followers = following = posts = None
-    fm = re.search(r'([\d.,KMB]+)\s+Followers', desc, re.I)
-    if fm: followers = parse_count(fm.group(1))
-    gm = re.search(r'([\d.,KMB]+)\s+Following', desc, re.I)
-    if gm: following = parse_count(gm.group(1))
-    pm = re.search(r'([\d.,KMB]+)\s+Posts', desc, re.I)
-    if pm: posts = parse_count(pm.group(1))
-
-    om = re.search(r'<meta property="og:image" content="([^"]+)"', html)
-    pic = om.group(1) if om else None
-
-    tm = re.search(r'<title>([^<]+)</title>', html)
-    title = tm.group(1) if tm else ""
-    name = title.split('(')[0].strip().replace(' • Instagram photos and videos', '') if title else username
-
-    if not followers and not following and not posts:
-        raise ValueError("Could not parse profile")
-
-    return {
-        "username": username, "full_name": name, "biography": desc,
-        "is_private": None, "is_verified": None,
-        "is_business": None, "profile_pic": pic,
-        "external_url": None, "category": None,
-        "followers": followers, "following": following, "posts": posts,
-        "user_id": None, "business_email": None, "business_phone": None,
-        "bio_links": [], "pronouns": None, "has_channel": None,
     }
 
 
@@ -169,7 +106,6 @@ def analyze_bio(bio):
 def compute_trust_score(p):
     score = 50
     signals = []
-
     followers = p.get("followers") or 0
     following = p.get("following") or 0
     posts = p.get("posts") or 0
@@ -177,11 +113,9 @@ def compute_trust_score(p):
     if p.get("is_verified"):
         score += 15
         signals.append({"text": "Verified account", "delta": 15, "type": "good"})
-
     if posts > 30:
         score += 10
         signals.append({"text": "Active posting history", "delta": 10, "type": "good"})
-
     if followers > 1000 and following > 0:
         ratio = followers / following
         if ratio > 5:
@@ -190,15 +124,12 @@ def compute_trust_score(p):
         elif ratio < 0.5:
             score -= 15
             signals.append({"text": f"Poor follower ratio ({ratio:.1f})", "delta": -15, "type": "bad"})
-
     if p.get("external_url"):
         score += 5
         signals.append({"text": "Has external link", "delta": 5, "type": "good"})
-
     if followers > 1000 and posts < 5:
         score -= 20
         signals.append({"text": "High followers but few posts", "delta": -20, "type": "bad"})
-
     if followers > 0 and posts == 0:
         score -= 10
         signals.append({"text": "Zero posts", "delta": -10, "type": "bad"})
@@ -208,11 +139,7 @@ def compute_trust_score(p):
     return {"score": score, "level": level, "signals": signals}
 
 
-# ---------------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------------
-
-@app.route("/api/insta/<username>", methods=["GET"])
+@app.route("/api/insta/<username>")
 def insta_info(username):
     username = normalize_username(username)
     if not username or not re.match(r'^[a-zA-Z0-9._]{1,30}$', username):
@@ -223,66 +150,36 @@ def insta_info(username):
         return jsonify(cached)
 
     now = datetime.now(timezone.utc).isoformat()
-
-    errors = []
-    profile = None
     try:
         profile = fetch_profile(username)
     except Exception as e:
-        errors.append(f"api: {e}")
-
-    if profile is None:
-        try:
-            profile = fetch_profile_fallback(username)
-        except Exception as e:
-            errors.append(f"fallback: {e}")
-
-    if profile is None:
-        return jsonify({
-            "success": False,
-            "error": "Could not fetch profile",
-            "details": errors,
-        }), 502
-
-    bio_analysis = analyze_bio(profile.get("biography"))
-    trust = compute_trust_score(profile)
+        return jsonify({"success": False, "error": str(e)}), 502
 
     result = {
         "success": True,
         "data": {
             "profile": profile,
-            "bio_analysis": bio_analysis,
-            "trust": trust,
+            "bio_analysis": analyze_bio(profile.get("biography")),
+            "trust": compute_trust_score(profile),
             "history": [],
             "growth": None,
             "checked_at": now,
         },
     }
-
     cache_set(username, result)
     return jsonify(result)
 
 
-@app.route("/health")
+@app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "service": "samarth-insta-info"})
+    return jsonify({"status": "ok"})
 
 
 @app.route("/")
-def index():
-    return send_from_directory(ROOT_DIR, "index.html")
+def root():
+    return jsonify({"service": "Samarth Insta Info", "status": "running"})
 
 
 @app.errorhandler(404)
 def not_found(e):
-    if request.path.startswith("/api/"):
-        return jsonify({
-            "success": False,
-            "error": "API endpoint not found",
-            "path": request.path,
-        }), 404
-    return send_from_directory(ROOT_DIR, "index.html")
-
-
-# Vercel looks for a variable named `app`
-handler = app
+    return jsonify({"success": False, "error": "Not found", "path": request.path}), 404
