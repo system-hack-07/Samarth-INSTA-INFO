@@ -1,53 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Samarth Insta Info — full free-tier build.
-Public data only. No session IDs. No paid APIs.
-"""
+"""Samarth Insta Info — public Instagram profile lookup."""
 
 import os
 import re
-import ssl
-import json
+import sys
 import time
-import socket
 import threading
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 import requests
 import urllib3
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 
-try:
-    from langdetect import detect as detect_lang, DetectorFactory
-    DetectorFactory.seed = 0
-    HAS_LANGDETECT = True
-except Exception:
-    HAS_LANGDETECT = False
-
-try:
-    from textblob import TextBlob
-    HAS_TEXTBLOB = True
-except Exception:
-    HAS_TEXTBLOB = False
-
-try:
-    import whois as whois_lib
-    HAS_WHOIS = True
-except Exception:
-    HAS_WHOIS = False
-
-import storage
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ---------------------------------------------------------------
+# Paths — always resolve from THIS file, not the cwd
+# ---------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
-app = Flask(__name__, static_folder=ROOT_DIR, static_url_path="")
+sys.path.insert(0, BASE_DIR)
+import storage  # noqa: E402
+
+# ---------------------------------------------------------------
+# Flask
+# ---------------------------------------------------------------
+app = Flask(__name__)
 CORS(app)
 
 CACHE = {}
@@ -85,14 +67,7 @@ def cache_set(key, value):
         CACHE[key] = {"ts": time.time(), "value": value}
 
 
-def clear_cache():
-    with LOCK:
-        n = len(CACHE)
-        CACHE.clear()
-        return n
-
-
-def normalize_username(u: str) -> str:
+def normalize_username(u):
     u = (u or "").strip()
     if not u:
         return ""
@@ -115,7 +90,7 @@ def parse_count(s):
     return int(n * mult.get(m.group(2).upper(), 1))
 
 
-def fetch_profile(username: str) -> dict:
+def fetch_profile(username):
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     r = requests.get(url, headers=HEADERS, timeout=15, verify=False)
     if r.status_code != 200:
@@ -126,10 +101,6 @@ def fetch_profile(username: str) -> dict:
     if not user:
         raise ValueError("Profile not found or private")
 
-    edge_followed = user.get("edge_followed_by") or {}
-    edge_follow = user.get("edge_follow") or {}
-    edge_media = user.get("edge_owner_to_timeline_media") or {}
-
     return {
         "username": user.get("username"),
         "full_name": user.get("full_name"),
@@ -137,24 +108,22 @@ def fetch_profile(username: str) -> dict:
         "is_private": user.get("is_private"),
         "is_verified": user.get("is_verified"),
         "is_business": user.get("is_business_account"),
-        "is_professional": user.get("is_professional_account"),
         "profile_pic": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
         "external_url": user.get("external_url"),
         "category": user.get("category_name"),
-        "followers": edge_followed.get("count"),
-        "following": edge_follow.get("count"),
-        "posts": edge_media.get("count"),
+        "followers": (user.get("edge_followed_by") or {}).get("count"),
+        "following": (user.get("edge_follow") or {}).get("count"),
+        "posts": (user.get("edge_owner_to_timeline_media") or {}).get("count"),
         "user_id": user.get("id"),
         "business_email": user.get("business_email"),
         "business_phone": user.get("business_phone_number"),
-        "business_address": user.get("business_address_json"),
         "bio_links": [l.get("url") for l in (user.get("bio_links") or []) if l.get("url")],
         "pronouns": user.get("pronouns"),
         "has_channel": user.get("has_channel"),
     }
 
 
-def fetch_profile_fallback(username: str) -> dict:
+def fetch_profile_fallback(username):
     url = f"https://www.instagram.com/{username}/"
     r = requests.get(url, headers=HEADERS, timeout=15, verify=False)
     if r.status_code != 200:
@@ -185,74 +154,28 @@ def fetch_profile_fallback(username: str) -> dict:
     return {
         "username": username, "full_name": name, "biography": desc,
         "is_private": None, "is_verified": None,
-        "is_business": None, "is_professional": None,
-        "profile_pic": pic, "external_url": None, "category": None,
+        "is_business": None, "profile_pic": pic,
+        "external_url": None, "category": None,
         "followers": followers, "following": following, "posts": posts,
         "user_id": None, "business_email": None, "business_phone": None,
-        "business_address": None, "bio_links": [], "pronouns": None,
-        "has_channel": None,
+        "bio_links": [], "pronouns": None, "has_channel": None,
     }
 
 
-def fetch_about_account(user_id: str) -> dict:
-    if not user_id:
-        return {}
-    return {
-        "created_year": None,
-        "created_month": None,
-        "account_country": None,
-        "former_username_count": None,
-    }
-
-
-def analyze_bio(bio: str) -> dict:
+def analyze_bio(bio):
     if not bio:
-        return {
-            "language": None, "sentiment": None, "sentiment_score": None,
-            "hashtags": [], "mentions": [], "emojis": [], "length": 0,
-        }
-
+        return {"language": None, "hashtags": [], "mentions": [], "length": 0}
     hashtags = re.findall(r'#(\w+)', bio)
     mentions = re.findall(r'@(\w+)', bio)
-    emojis = re.findall(
-        r'[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]',
-        bio
-    )
-
-    lang = None
-    if HAS_LANGDETECT and len(bio) > 3:
-        try:
-            lang = detect_lang(bio)
-        except Exception:
-            pass
-
-    sentiment = None
-    score = None
-    if HAS_TEXTBLOB and len(bio) > 3:
-        try:
-            blob = TextBlob(bio)
-            score = round(blob.sentiment.polarity, 3)
-            if score > 0.1:
-                sentiment = "positive"
-            elif score < -0.1:
-                sentiment = "negative"
-            else:
-                sentiment = "neutral"
-        except Exception:
-            pass
-
     return {
-        "language": lang,
-        "sentiment": sentiment,
-        "sentiment_score": score,
+        "language": None,
         "hashtags": list(dict.fromkeys(hashtags))[:20],
         "mentions": list(dict.fromkeys(mentions))[:20],
-        "emojis": list(dict.fromkeys(emojis))[:20],
         "length": len(bio),
     }
 
 
-def compute_trust_score(p: dict, history: list) -> dict:
+def compute_trust_score(p, history):
     score = 50
     signals = []
 
@@ -262,28 +185,24 @@ def compute_trust_score(p: dict, history: list) -> dict:
 
     if p.get("is_verified"):
         score += 15
-        signals.append({"text": "Verified account", "delta": +15, "type": "good"})
+        signals.append({"text": "Verified account", "delta": 15, "type": "good"})
 
     if posts > 30:
         score += 10
-        signals.append({"text": "Active posting history", "delta": +10, "type": "good"})
+        signals.append({"text": "Active posting history", "delta": 10, "type": "good"})
 
     if followers > 1000 and following > 0:
         ratio = followers / following
         if ratio > 5:
             score += 10
-            signals.append({"text": f"Healthy follower ratio ({ratio:.1f})", "delta": +10, "type": "good"})
+            signals.append({"text": f"Healthy follower ratio ({ratio:.1f})", "delta": 10, "type": "good"})
         elif ratio < 0.5:
             score -= 15
             signals.append({"text": f"Poor follower ratio ({ratio:.1f})", "delta": -15, "type": "bad"})
 
     if p.get("external_url"):
         score += 5
-        signals.append({"text": "Has external link", "delta": +5, "type": "good"})
-
-    if p.get("business_email") or p.get("business_phone"):
-        score += 10
-        signals.append({"text": "Business contact listed", "delta": +10, "type": "good"})
+        signals.append({"text": "Has external link", "delta": 5, "type": "good"})
 
     if followers > 1000 and posts < 5:
         score -= 20
@@ -293,82 +212,14 @@ def compute_trust_score(p: dict, history: list) -> dict:
         score -= 10
         signals.append({"text": "Zero posts", "delta": -10, "type": "bad"})
 
-    if p.get("is_private"):
-        signals.append({"text": "Private account", "delta": 0, "type": "info"})
-
-    if history and len(history) >= 2:
-        first = history[0].get("followers") or 0
-        last = history[-1].get("followers") or 0
-        if first > 0:
-            growth = ((last - first) / first) * 100
-            if growth > 20:
-                signals.append({"text": f"Growing fast (+{growth:.0f}%)", "delta": +5, "type": "good"})
-                score += 5
-            elif growth < -5:
-                signals.append({"text": f"Declining ({growth:.0f}%)", "delta": -5, "type": "bad"})
-                score -= 5
-
     score = max(0, min(100, score))
-
-    if score >= 70:
-        level = "green"
-    elif score >= 40:
-        level = "amber"
-    else:
-        level = "red"
-
+    level = "green" if score >= 70 else "amber" if score >= 40 else "red"
     return {"score": score, "level": level, "signals": signals}
 
 
-def estimate_engagement(p: dict) -> dict:
-    followers = p.get("followers") or 0
-    if followers == 0:
-        return {"engagement_rate": None, "note": "No follower data"}
-    return {
-        "engagement_rate": None,
-        "note": "Requires post-level data (not publicly exposed without login)",
-        "followers_for_estimate": followers,
-    }
-
-
-def check_link(url: str) -> dict:
-    result = {"url": url, "http_status": None, "ssl_valid": None,
-              "domain_age_days": None, "domain": None}
-
-    try:
-        parsed = urlparse(url)
-        domain = parsed.netloc or parsed.path
-        result["domain"] = domain
-
-        r = requests.head(url, headers=HEADERS, timeout=8,
-                          allow_redirects=True, verify=False)
-        result["http_status"] = r.status_code
-
-        try:
-            ctx = ssl.create_default_context()
-            with socket.create_connection((domain, 443), timeout=5) as sock:
-                with ctx.wrap_socket(sock, server_hostname=domain):
-                    result["ssl_valid"] = True
-        except Exception:
-            result["ssl_valid"] = False
-
-        if HAS_WHOIS:
-            try:
-                w = whois_lib.whois(domain)
-                created = w.creation_date
-                if isinstance(created, list):
-                    created = created[0]
-                if created:
-                    age = (datetime.now() - created).days
-                    result["domain_age_days"] = age
-            except Exception:
-                pass
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
+# ---------------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------------
 
 @app.route("/api/insta/<username>", methods=["GET"])
 def insta_info(username):
@@ -399,43 +250,18 @@ def insta_info(username):
         return jsonify({
             "success": False,
             "error": "Could not fetch profile",
-            "details": errors
+            "details": errors,
         }), 502
-
-    about = fetch_about_account(profile.get("user_id"))
 
     try:
         storage.save_snapshot(profile, now)
-        storage.save_profile_meta(username, {
-            "user_id": profile.get("user_id"),
-            "created_year": about.get("created_year"),
-            "created_month": about.get("created_month"),
-            "account_country": about.get("account_country"),
-            "former_username_count": about.get("former_username_count"),
-        }, now)
+        storage.save_profile_meta(username, {"user_id": profile.get("user_id")}, now)
     except Exception:
         pass
 
     history = storage.get_history(username, 90)
     bio_analysis = analyze_bio(profile.get("biography"))
     trust = compute_trust_score(profile, history)
-    engagement = estimate_engagement(profile)
-
-    link_checks = []
-    for url in ([profile.get("external_url")] + (profile.get("bio_links") or [])):
-        if url and url not in [l["url"] for l in link_checks]:
-            lc = check_link(url)
-            link_checks.append(lc)
-            try:
-                storage.save_link_check(
-                    username, url,
-                    lc.get("http_status") or 0,
-                    bool(lc.get("ssl_valid")),
-                    lc.get("domain_age_days") or 0,
-                    now
-                )
-            except Exception:
-                pass
 
     growth = None
     if len(history) >= 2:
@@ -452,20 +278,10 @@ def insta_info(username):
         "success": True,
         "data": {
             "profile": profile,
-            "about": about,
             "bio_analysis": bio_analysis,
             "trust": trust,
-            "engagement": engagement,
-            "links": link_checks,
             "history": history,
             "growth": growth,
-            "sources": {
-                "profile": "Instagram public web_profile_info",
-                "about": "Instagram public info endpoint",
-                "bio_analysis": "langdetect + TextBlob (local)",
-                "whois": "python-whois (public WHOIS servers)",
-                "history": "local SQLite (built over time)",
-            },
             "checked_at": now,
         },
     }
@@ -474,51 +290,35 @@ def insta_info(username):
     return jsonify(result)
 
 
-@app.route("/history/<username>", methods=["GET"])
-def history(username):
-    username = normalize_username(username)
-    if not username:
-        return jsonify({"success": False, "error": "Invalid username"}), 400
-    h = storage.get_history(username, 365)
-    return jsonify({"success": True, "username": username, "history": h})
-
-
-@app.route("/cache/clear", methods=["GET"])
-def clear():
-    n = clear_cache()
-    return jsonify({"success": True, "cleared": n})
-
-
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "service": "samarth-insta-info",
-        "whois": HAS_WHOIS,
-        "langdetect": HAS_LANGDETECT,
-        "textblob": HAS_TEXTBLOB,
-    })
+    return jsonify({"status": "ok", "service": "samarth-insta-info"})
 
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
     return send_from_directory(ROOT_DIR, "index.html")
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
+
+
 @app.errorhandler(404)
-def not_found(_):
-    return jsonify({"success": False, "error": "Not found"}), 404
-
-
-@app.errorhandler(500)
-def server_error(_):
-    return jsonify({"success": False, "error": "Server error"}), 500
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "success": False,
+            "error": "API endpoint not found",
+            "path": request.path,
+        }), 404
+    return send_from_directory(ROOT_DIR, "index.html")
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"→ Service: Samarth Insta Info")
-    print(f"→ WHOIS: {'on' if HAS_WHOIS else 'off'}")
-    print(f"→ langdetect: {'on' if HAS_LANGDETECT else 'off'}")
-    print(f"→ textblob: {'on' if HAS_TEXTBLOB else 'off'}")
+    print(f"\n  Samarth Insta Info")
+    print(f"  Frontend:  http://localhost:{port}/")
+    print(f"  API test:  http://localhost:{port}/api/insta/nasa\n")
     app.run(host="0.0.0.0", port=port, debug=False)
